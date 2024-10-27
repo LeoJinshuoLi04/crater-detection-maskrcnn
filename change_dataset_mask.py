@@ -10,6 +10,7 @@ from itertools import compress
 from joblib import Parallel, delayed, load
 import json
 import pycocotools.mask as mask_util
+from natsort import natsorted
 
 
 labels = load('CE5-ellipse-labels')
@@ -47,33 +48,33 @@ def plot_ellipses( img, bboxes, ellipse_matrices, color = ( 1, 0, 0 ) ):
 
 def load_bounding_boxes(paths):
     ground_truth = []
-    paths_set = set(paths.replace('.png', '')) 
-
-    for label in labels:
-        # Only process the label if its 'id' is in the specified paths
-        if label['id'] in paths_set:
-            samples = {}
-            samples['boxes'] = []
-            
-            # Loop over all ellipses in the 'ellipse_sparse' data
-            for ellipse in label['ellipse_sparse']:
-                x_center, y_center, a, b, angle = ellipse
-                cos_angle = np.cos(angle)
-                sin_angle = np.sin(angle)
-                
-                # Calculate the bounding box
-                width = np.sqrt((a * cos_angle) ** 2 + (b * sin_angle) ** 2)
-                height = np.sqrt((a * sin_angle) ** 2 + (b * cos_angle) ** 2)
-                x_min = x_center - width
-                x_max = x_center + width
-                y_min = y_center - height
-                y_max = y_center + height
-                
-                # Add the bounding box to samples
-                samples['boxes'].append([x_min, y_min, x_max, y_max])
-            
-            # Append the samples for this label to the ground truth list
-            ground_truth.append(samples)
+    for path in paths:
+      for label in labels:
+          # Only process the label if its 'id' is in the specified paths
+          if label['id'] == path:
+              samples = {}
+              samples['boxes'] = []
+              
+              # Loop over all ellipses in the 'ellipse_sparse' data
+              for ellipse in label['ellipse_sparse']:
+                  x_center, y_center, a, b, angle = ellipse
+                  angle = angle * 180 / math.pi
+                  cos_angle = np.cos(angle)
+                  sin_angle = np.sin(angle)
+                  
+                  # Calculate the bounding box
+                  width = np.sqrt((a * cos_angle) ** 2 + (b * sin_angle) ** 2)
+                  height = np.sqrt((a * sin_angle) ** 2 + (b * cos_angle) ** 2)
+                  x_min = x_center - width
+                  x_max = x_center + width
+                  y_min = y_center - height
+                  y_max = y_center + height
+                  
+                  # Add the bounding box to samples
+                  samples['boxes'].append([x_min * 23.52, y_min * 17.28, x_max *23.52, y_max *17.28])
+              
+              # Append the samples for this label to the ground truth list
+              ground_truth.append(samples)
     
     return ground_truth
 
@@ -82,10 +83,29 @@ def load_projected_ellipses(path):
 
     for label in labels:
         # Only process the label if its 'id' is in the specified paths
-        if label['id'] == path.replace('.png', ''):      
+        if label['id'] == path:      
             # Loop over all ellipses in the 'ellipse_sparse' data
             for ellipse in label['ellipse_sparse']:
-                samples['ellipse_sparse'].append(ellipse)
+                x_center, y_center, semi_major, semi_minor, angle = ellipse
+
+                # Scale the ellipse coordinates and sizes according to the image dimensions
+                x_center_scaled = x_center * 23.52
+                y_center_scaled = y_center * 17.28
+                semi_major_scaled = semi_major * 23.52
+                semi_minor_scaled = semi_minor * 17.28
+
+                # Append the scaled ellipse parameters to the samples
+                samples['ellipse_sparse'].append([x_center_scaled, y_center_scaled, semi_major_scaled, semi_minor_scaled, angle* math.pi / 180])
+
+    if samples['ellipse_sparse']:
+        samples['ellipse_sparse'] = torch.tensor(samples['ellipse_sparse'], dtype=torch.float32)
+        if len(samples['ellipse_sparse'].shape) < 2:
+            print("No valid ellipse data found. Returning None.")
+            return None
+    else:
+        print("No ellipses were fitted. Returning None.")
+        return None
+
     return samples
 
 def compute_mask( image_size, ellipses ):
@@ -109,7 +129,7 @@ def compute_mask( image_size, ellipses ):
             img,
             ( int( e[0].item() ), int( e[1].item() ) ), # Center point
             ( int( e[2].item() ), int( e[3].item() ) ), # Major and minor axes
-            e[4].item() * 180 / math.pi, # Convert angle from radians to degrees
+            e[4].item()* 180 / math.pi, # Convert angle from radians to degrees
             0, # Start Angle for drawing
             360, # End Angle for drawing
             ( 1 ),
@@ -135,7 +155,7 @@ class CraterDataset( torch.utils.data.Dataset ):
         self.imgs = []
         self.img_size = img_size
         self.catalogue = catalogue
-        imgs = list(sorted(os.listdir(self.root)))
+        imgs = list(natsorted(os.listdir(self.root)))
         imgs = [img for img in imgs if 'ipynb_checkpoints' not in img and '.DS_Store' not in img and img.endswith('.png')]
 
         # Add the images to self.imgs with the correct file paths
@@ -166,11 +186,7 @@ class CraterDataset( torch.utils.data.Dataset ):
 
         # Iterate through all the indices
         for i in range(totalSamples):
-            # Check if the index is a multiple of 10
-            if i % 10 == 0:
-                testIndices.append(i)  # Add to test if it's a multiple of 10
-            else:
-                trainIndices.append(i)  # Add to train if it's not a multiple of 10
+            testIndices.append(i)
 
         return trainIndices, testIndices
 
@@ -189,7 +205,7 @@ class CraterDataset( torch.utils.data.Dataset ):
             return None
 
         # Filter as necessary
-        mask = np.array( np.ones( len( bboxes ) ), dtype = np.bool )
+        mask = np.array( np.ones( len( bboxes ) ), dtype = bool )
         if np.sum( mask ) > 0: mask = np.logical_and( self.sizeFilter( bboxes, minArea = 0.1 ), mask )
         # if np.sum( mask ) > 0: mask = np.logical_and( self.depthFilter( ids, minDepth = 0.2 ), mask )
         
@@ -198,10 +214,10 @@ class CraterDataset( torch.utils.data.Dataset ):
         # print(self.imgs[idx])
         # print (bboxes.shape)
         # print(len(ellipses['ellipse_sparse']))
+        # print(ids)
         target['ellipse_sparse'] = ellipses['ellipse_sparse'][mask]
         target['labels'] = labels[mask]
         target['masks'] = compute_mask( self.img_size, target['ellipse_sparse'] )
-        target['crater_id'] = ids[mask]
         target['image_id'] = self.root + self.imgs[idx]
         # target['depths'] = depths
         # target['view_angle'] = torch.tensor( [ self.img_angles[idx] ] )
@@ -217,23 +233,22 @@ class CraterDataset( torch.utils.data.Dataset ):
         
         target = self.getTarget( idx )
         return img, target
-    
+
     def sizeFilter( self, bboxes, minArea = 25, maxArea = 2560 * 2560 ):
         areas = ( bboxes[:,3] - bboxes[:,1] ) * ( bboxes[:,2] - bboxes[:,0] )
-        min_mask = np.array( areas >= minArea, dtype = np.bool )
-        max_mask = np.array( areas <= maxArea, dtype = np.bool )
+        min_mask = np.array( areas >= minArea, dtype = bool )
+        max_mask = np.array( areas <= maxArea, dtype = bool )
         return np.logical_and( min_mask, max_mask )
-    
+
     def depthFilter( self, crater_ids, minDepth = 0.2 ):
         depths = self.catalogue.loc[self.catalogue['CRATER_ID'].isin( crater_ids )]['medianDifference']
-        return np.array( depths >= minDepth, dtype = np.bool )
-    
+        return np.array( depths >= minDepth, dtype = bool )
+
 def checkSample( dataset, i ):
     _, targets = dataset.__getitem__( i )
     if targets is None:
         return False
     return True
-
 def evaluate_ellipse( a, b ):
     '''
     Evaluate error between two ellipses based on:
@@ -256,14 +271,40 @@ def evaluate_ellipse( a, b ):
     error['absolute_error'] = np.sum( np.abs( np.array( a ) - np.array( b ) ) )
     
     # Convert sparse ellipse params into conic matrices
-    # a_m = ellipse_to_conic_matrix( *wrap_ellipse( [ a[2], a[3], a[0], a[1], a[4], ] ) ).float()
-    # b_m = ellipse_to_conic_matrix( *wrap_ellipse( [ b[2], b[3], b[0], b[1], b[4], ] ) ).float()
-    
-    # error['gaussian_angle'] = gaussian_angle_distance( a_m, b_m ).item()
-    # error['kl_divergence'] = norm_mv_kullback_leibler_divergence( a_m.unsqueeze( 0 ), b_m.unsqueeze( 0 ) ).item()
-    
+    # Convert ellipse parameters to conic matrices inline
+    cos_a, sin_a = np.cos(a[4]), np.sin(a[4])
+    A_a = (cos_a**2) / a[2]**2 + (sin_a**2) / a[3]**2
+    B_a = 2 * cos_a * sin_a * (1 / a[2]**2 - 1 / a[3]**2)
+    C_a = (sin_a**2) / a[2]**2 + (cos_a**2) / a[3]**2
+    D_a = -2 * A_a * a[0] - B_a * a[1]
+    E_a = -2 * C_a * a[1] - B_a * a[0]
+    F_a = A_a * a[0]**2 + B_a * a[0] * a[1] + C_a * a[1]**2 - 1
+    a_m = torch.tensor([[A_a, B_a / 2, D_a / 2],
+                        [B_a / 2, C_a, E_a / 2],
+                        [D_a / 2, E_a / 2, F_a]]).float()
+
+    cos_b, sin_b = np.cos(b[4]), np.sin(b[4])
+    A_b = (cos_b**2) / b[2]**2 + (sin_b**2) / b[3]**2
+    B_b = 2 * cos_b * sin_b * (1 / b[2]**2 - 1 / b[3]**2)
+    C_b = (sin_b**2) / b[2]**2 + (cos_b**2) / b[3]**2
+    D_b = -2 * A_b * b[0] - B_b * b[1]
+    E_b = -2 * C_b * b[1] - B_b * b[0]
+    F_b = A_b * b[0]**2 + B_b * b[0] * b[1] + C_b * b[1]**2 - 1
+    b_m = torch.tensor([[A_b, B_b / 2, D_b / 2],
+                        [B_b / 2, C_b, E_b / 2],
+                        [D_b / 2, E_b / 2, F_b]]).float()
+
+    # Calculate Gaussian angle distance inline
+    error['gaussian_angle'] = torch.norm(a_m - b_m).item()
+
+    # Calculate KL divergence inline
+    det_a = torch.det(a_m[:2, :2])
+    det_b = torch.det(b_m[:2, :2])
+    trace_term = torch.trace(torch.mm(torch.inverse(b_m[:2, :2]), a_m[:2, :2]))
+    error['kl_divergence'] = 0.5 * (torch.log(det_b / det_a) - 2 + trace_term).item()
+
     # Intersection over union!
-    img_shape = ( 1200, 1920, 3 )
+    img_shape = ( 1728, 2352, 3 )
     img1 = np.zeros( img_shape )
     img2 = np.zeros( img_shape )
     

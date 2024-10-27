@@ -11,8 +11,8 @@ from joblib import Parallel, delayed
 import json
 import pycocotools.mask as mask_util
 
-def plot_ellipses( img, bboxes, ellipse_matrices, color = ( 1, 0, 0 ) ):
-    for bbox, ellipse_matrix in zip( bboxes, ellipse_matrices ):
+def plot_ellipses( img, bboxes, ellipses, color = ( 1, 0, 0 ) ):
+    for bbox, ellipse in zip( bboxes, ellipses):
         # Plot bounding box:
         cv2.rectangle(
             img,
@@ -30,16 +30,16 @@ def plot_ellipses( img, bboxes, ellipse_matrices, color = ( 1, 0, 0 ) ):
         # theta = ellipse_angle( ellipse_matrix )
         
         # # Plot ellipse:
-        # cv2.ellipse( 
-        #     img,
-        #     ( int( x.item() ), int( y.item() ) ), # Center point
-        #     ( int( a.item() ), int( b.item() ) ), # Major and minor axes
-        #     theta.item() * 180 / math.pi, # Convert angle from radians to degrees
-        #     0, # Start Angle for drawing
-        #     360, # End Angle for drawing
-        #     color,
-        #     2,
-        # )
+        cv2.ellipse( 
+            img,
+            ( int( ellipse[0] ), int( ellipse[1] ) ), # Center point
+            ( int( ellipse[2]), int( ellipse[3] ) ), # Major and minor axes
+            (int (ellipse[4])) * 180 / math.pi, # Convert angle from radians to degrees
+            0, # Start Angle for drawing
+            360, # End Angle for drawing
+            color,
+            2,
+        )
     return img
 
 def load_bounding_boxes(paths):
@@ -70,7 +70,13 @@ def load_bounding_boxes(paths):
                 x, y, w, h = bbox
                 box = [int(x), int(y), int(x + w), int(y + h)]  # Convert bbox to [x_min, y_min, x_max, y_max]
 
-                box = [max(min(coord, 1200), 0) for coord in box[:2]] + [max(min(coord, 1920), 0) for coord in box[2:]]
+                box = [
+                    max(min(int(x), 1920), 0),
+                    max(min(int(y), 1200), 0), 
+                    max(min(int(x + w), 1920), 0), 
+                    max(min(int(y + h), 1200), 0) 
+                ]
+                
                 
                 samples['boxes'].append(box)
 
@@ -287,7 +293,7 @@ class CraterDataset( torch.utils.data.Dataset ):
             return None
 
         # Filter as necessary
-        mask = np.array( np.ones( len( bboxes ) ), dtype = np.bool )
+        mask = np.array( np.ones( len( bboxes ) ), dtype = bool )
         if np.sum( mask ) > 0: mask = np.logical_and( self.sizeFilter( bboxes, minArea = 0.1 ), mask )
         # if np.sum( mask ) > 0: mask = np.logical_and( self.depthFilter( ids, minDepth = 0.2 ), mask )
         
@@ -296,6 +302,7 @@ class CraterDataset( torch.utils.data.Dataset ):
         # print(self.imgs[idx])
         # print (bboxes.shape)
         # print(len(ellipses['ellipse_sparse']))
+        # print(ids)
         target['ellipse_sparse'] = ellipses['ellipse_sparse'][mask]
         target['labels'] = labels[mask]
         target['masks'] = compute_mask( self.img_size, target['ellipse_sparse'] )
@@ -304,6 +311,8 @@ class CraterDataset( torch.utils.data.Dataset ):
         # target['depths'] = depths
         # target['view_angle'] = torch.tensor( [ self.img_angles[idx] ] )
         target['area'] = ( bboxes[:,3] - bboxes[:,1] ) * ( bboxes[:,2] - bboxes[:,0] )
+        for mask in target['masks']:
+            print(mask.shape)
         
         return target
         
@@ -318,13 +327,13 @@ class CraterDataset( torch.utils.data.Dataset ):
     
     def sizeFilter( self, bboxes, minArea = 25, maxArea = 2560 * 2560 ):
         areas = ( bboxes[:,3] - bboxes[:,1] ) * ( bboxes[:,2] - bboxes[:,0] )
-        min_mask = np.array( areas >= minArea, dtype = np.bool )
-        max_mask = np.array( areas <= maxArea, dtype = np.bool )
+        min_mask = np.array( areas >= minArea, dtype = bool )
+        max_mask = np.array( areas <= maxArea, dtype = bool )
         return np.logical_and( min_mask, max_mask )
     
     def depthFilter( self, crater_ids, minDepth = 0.2 ):
         depths = self.catalogue.loc[self.catalogue['CRATER_ID'].isin( crater_ids )]['medianDifference']
-        return np.array( depths >= minDepth, dtype = np.bool )
+        return np.array( depths >= minDepth, dtype = bool )
     
 def checkSample( dataset, i ):
     _, targets = dataset.__getitem__( i )
@@ -354,12 +363,38 @@ def evaluate_ellipse( a, b ):
     error['absolute_error'] = np.sum( np.abs( np.array( a ) - np.array( b ) ) )
     
     # Convert sparse ellipse params into conic matrices
-    # a_m = ellipse_to_conic_matrix( *wrap_ellipse( [ a[2], a[3], a[0], a[1], a[4], ] ) ).float()
-    # b_m = ellipse_to_conic_matrix( *wrap_ellipse( [ b[2], b[3], b[0], b[1], b[4], ] ) ).float()
-    
-    # error['gaussian_angle'] = gaussian_angle_distance( a_m, b_m ).item()
-    # error['kl_divergence'] = norm_mv_kullback_leibler_divergence( a_m.unsqueeze( 0 ), b_m.unsqueeze( 0 ) ).item()
-    
+    # Convert ellipse parameters to conic matrices inline
+    cos_a, sin_a = np.cos(a[4]), np.sin(a[4])
+    A_a = (cos_a**2) / a[2]**2 + (sin_a**2) / a[3]**2
+    B_a = 2 * cos_a * sin_a * (1 / a[2]**2 - 1 / a[3]**2)
+    C_a = (sin_a**2) / a[2]**2 + (cos_a**2) / a[3]**2
+    D_a = -2 * A_a * a[0] - B_a * a[1]
+    E_a = -2 * C_a * a[1] - B_a * a[0]
+    F_a = A_a * a[0]**2 + B_a * a[0] * a[1] + C_a * a[1]**2 - 1
+    a_m = torch.tensor([[A_a, B_a / 2, D_a / 2],
+                        [B_a / 2, C_a, E_a / 2],
+                        [D_a / 2, E_a / 2, F_a]]).float()
+
+    cos_b, sin_b = np.cos(b[4]), np.sin(b[4])
+    A_b = (cos_b**2) / b[2]**2 + (sin_b**2) / b[3]**2
+    B_b = 2 * cos_b * sin_b * (1 / b[2]**2 - 1 / b[3]**2)
+    C_b = (sin_b**2) / b[2]**2 + (cos_b**2) / b[3]**2
+    D_b = -2 * A_b * b[0] - B_b * b[1]
+    E_b = -2 * C_b * b[1] - B_b * b[0]
+    F_b = A_b * b[0]**2 + B_b * b[0] * b[1] + C_b * b[1]**2 - 1
+    b_m = torch.tensor([[A_b, B_b / 2, D_b / 2],
+                        [B_b / 2, C_b, E_b / 2],
+                        [D_b / 2, E_b / 2, F_b]]).float()
+
+    # Calculate Gaussian angle distance inline
+    error['gaussian_angle'] = torch.norm(a_m - b_m).item()
+
+    # Calculate KL divergence inline
+    det_a = torch.det(a_m[:2, :2])
+    det_b = torch.det(b_m[:2, :2])
+    trace_term = torch.trace(torch.mm(torch.inverse(b_m[:2, :2]), a_m[:2, :2]))
+    error['kl_divergence'] = 0.5 * (torch.log(det_b / det_a) - 2 + trace_term).item()
+
     # Intersection over union!
     img_shape = ( 1200, 1920, 3 )
     img1 = np.zeros( img_shape )
